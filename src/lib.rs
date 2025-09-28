@@ -189,37 +189,6 @@ impl CentralSchemaResolver {
         }
     }
 
-    // fn resolve_custom_type(
-    //     &self, raw: &str, current_package: &str,
-    // ) -> Option<String> {
-    //     let base = strip_array_suffix(raw);
-    //
-    //     let builtin_types = [
-    //         "bool", "byte", "char", "int8", "uint8", "int16", "uint16", "int32",
-    //         "uint32", "int64", "uint64", "float32", "float64", "string",
-    //         "wstring",
-    //     ];
-    //
-    //     if builtin_types.contains(&base) {
-    //         return None;
-    //     }
-    //
-    //     if base.contains('/') {
-    //         if base.contains("/msg/") {
-    //             Some(base.to_string())
-    //         } else {
-    //             let segments = base.split('/').collect::<Vec<_>>();
-    //             if segments.len() == 2 {
-    //                 Some(format!("{}/msg/{}", segments[0], segments[1]))
-    //             } else {
-    //                 None
-    //             }
-    //         }
-    //     } else {
-    //         Some(format!("{}/msg/{}", current_package, base))
-    //     }
-    // }
-
     fn flatten_inner(
         &self, current_type: &str, definition: &str,
         visited: &mut HashSet<String>, flat: &mut Vec<String>,
