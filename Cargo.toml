@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 repository = "https://github.com/okieraised/ros2-mcap-schema-builder"
 license = "MIT OR Apache-2.0"
+description = "A simple library to generate ROS2 MCAP schema definitions"
 
 
 [dependencies]
