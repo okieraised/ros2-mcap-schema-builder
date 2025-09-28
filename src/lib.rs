@@ -1,11 +1,12 @@
 use anyhow::{Result, anyhow};
-use std::collections::{BTreeMap, HashSet};
-use std::{env, fs};
-use std::path::{Path, PathBuf};
 use once_cell::sync::OnceCell;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::{env, fs};
 
-static GLOBAL_RESOLVER: OnceCell<CentralSchemaResolver> = OnceCell::new();
+const AMENT_PREFIX_PATH: &str = "AMENT_PREFIX_PATH";
 
+pub static GLOBAL_RESOLVER: OnceCell<CentralSchemaResolver> = OnceCell::new();
 
 #[derive(Debug, Default)]
 pub struct CentralSchemaResolver {
@@ -34,7 +35,6 @@ impl CentralSchemaResolver {
         })
     }
 
-
     pub fn register_msg_dir(
         &mut self, package: &str, path: PathBuf,
     ) -> Result<()> {
@@ -51,11 +51,8 @@ impl CentralSchemaResolver {
     }
 
     pub fn register_ros2_from_env(&mut self) -> Result<()> {
-        let os = env::var_os("AMENT_PREFIX_PATH")
+        let os = env::var_os(AMENT_PREFIX_PATH)
             .ok_or_else(|| anyhow!("AMENT_PREFIX_PATH is not set"))?;
-
-
-        println!("SPLITTTTTTT {:?}", env::split_paths(&os).next().unwrap());
 
         self.register_ros2_standard_paths_any(env::split_paths(&os))
     }
@@ -101,12 +98,10 @@ impl CentralSchemaResolver {
     where
         I: IntoIterator<Item = PathBuf>,
     {
-
         let mut prefixes: Vec<PathBuf> = prefixes.into_iter().collect();
         prefixes.sort();
         for prefix in prefixes {
             println!("cargo:rerun-if-changed={}", prefix.display());
-
 
             let share_dir = prefix.join("share");
             if !share_dir.exists() {
@@ -134,8 +129,6 @@ impl CentralSchemaResolver {
         Ok(())
     }
 
-
-
     pub fn flatten(&self, root_type: &str) -> Result<String> {
         let mut visited = HashSet::new();
         let mut flat = vec![];
@@ -149,28 +142,31 @@ impl CentralSchemaResolver {
         // Remove any array suffixes: [], [N], [<=N]
         let base = strip_array_suffix(raw);
 
-        // Exact builtins
         match base {
-            "bool" | "byte" | "char" |
-            "int8" | "uint8" | "int16" | "uint16" |
-            "int32" | "uint32" | "int64" | "uint64" |
-            "float32" | "float64" |
-            "string" | "wstring" => return true,
-            _ => {}
+            "bool" | "byte" | "char" | "int8" | "uint8" | "int16" | "uint16"
+            | "int32" | "uint32" | "int64" | "uint64" | "float32" | "float64"
+            | "string" | "wstring" => return true,
+            _ => {},
         }
 
         // Bounded strings: string<=N / wstring<=N
         if let Some(rest) = base.strip_prefix("string") {
-            return rest.is_empty() || (rest.starts_with("<=") && rest[2..].chars().all(|c| c.is_ascii_digit()));
+            return rest.is_empty()
+                || (rest.starts_with("<=")
+                    && rest[2..].chars().all(|c| c.is_ascii_digit()));
         }
         if let Some(rest) = base.strip_prefix("wstring") {
-            return rest.is_empty() || (rest.starts_with("<=") && rest[2..].chars().all(|c| c.is_ascii_digit()));
+            return rest.is_empty()
+                || (rest.starts_with("<=")
+                    && rest[2..].chars().all(|c| c.is_ascii_digit()));
         }
 
         false
     }
 
-    fn resolve_custom_type(&self, raw: &str, current_package: &str) -> Option<String> {
+    fn resolve_custom_type(
+        &self, raw: &str, current_package: &str,
+    ) -> Option<String> {
         if self.is_builtin_type(raw) {
             return None; // don't recurse for builtins (incl. string<=N)
         }
@@ -181,9 +177,9 @@ impl CentralSchemaResolver {
             if base.contains("/msg/") {
                 Some(base.to_string())
             } else {
-                let mut segs = base.split('/').collect::<Vec<_>>();
-                if segs.len() == 2 {
-                    Some(format!("{}/msg/{}", segs[0], segs[1]))
+                let segments = base.split('/').collect::<Vec<_>>();
+                if segments.len() == 2 {
+                    Some(format!("{}/msg/{}", segments[0], segments[1]))
                 } else {
                     None
                 }
@@ -192,7 +188,6 @@ impl CentralSchemaResolver {
             Some(format!("{}/msg/{}", current_package, base))
         }
     }
-
 
     // fn resolve_custom_type(
     //     &self, raw: &str, current_package: &str,
@@ -281,36 +276,36 @@ impl CentralSchemaResolver {
     }
 }
 
-// fn strip_array_suffix(s: &str) -> &str {
-//     let mut end = s.len();
-//     let mut result = s;
-//
-//     loop {
-//         if let Some(start) = result.rfind('[') {
-//             if result.ends_with(']') && start < end - 1 {
-//                 let inner = &result[start + 1..end - 1];
-//                 if inner.is_empty() || inner.chars().all(|c| c.is_ascii_digit()) {
-//                     // Trim this suffix
-//                     end = start;
-//                     result = &result[..end];
-//                     continue; // Check if there are more suffixes
-//                 }
-//             }
-//         }
-//         break; // No more valid suffixes found
-//     }
-//
-//     result
-// }
+/// Strips ROS 2 `.msg` suffixes from a type and returns a subslice of the input.
+///
+/// This removes one or more **trailing** array designators:
+/// - `[]`     — unbounded array
+/// - `[N]`    — fixed-size array (where `N` is digits)
+/// - `[<=N]`  — bounded array with an upper limit
+///
+/// It trims valid array suffixes from the **end** of the string
+/// until no more are found, then returns the remaining base type. It does **not**
+/// allocate and does not modify the input
+///
+/// It does **not** touch non-array qualifiers like bounded strings (`string<=256`);
+/// for example, `string<=256[<=8]` becomes `string<=256`.
+///
+/// Invalid or non-matching bracket tails are left intact (the function stops trimming
+/// when it encounters something that is not a valid array suffix).
 fn strip_array_suffix(mut s: &str) -> &str {
     loop {
-        let Some(lb) = s.rfind('[') else { break; };
-        if !s.ends_with(']') || lb == 0 { break; }
+        let Some(lb) = s.rfind('[') else {
+            break;
+        };
+        if !s.ends_with(']') || lb == 0 {
+            break;
+        }
 
-        let inner = s[lb+1..s.len()-1].trim();
+        let inner = s[lb + 1..s.len() - 1].trim();
         let ok = inner.is_empty()
             || inner.chars().all(|c| c.is_ascii_digit())
-            || (inner.starts_with("<=") && inner[2..].trim().chars().all(|c| c.is_ascii_digit()));
+            || (inner.starts_with("<=")
+                && inner[2..].trim().chars().all(|c| c.is_ascii_digit()));
 
         if ok {
             s = &s[..lb];
@@ -321,7 +316,6 @@ fn strip_array_suffix(mut s: &str) -> &str {
     s
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +325,7 @@ mod tests {
     #[test]
     fn test_strip_array_suffix() {
         println!("{}", strip_array_suffix("FloatingPointRange[<=1]"));
+        println!("{}", strip_array_suffix("int32[]"));
     }
 
     #[test]

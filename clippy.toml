@@ -1,0 +1,2 @@
+single-char-binding-names-threshold = 1000
+msrv="1.88.0"
