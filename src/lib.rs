@@ -1,7 +1,11 @@
 use anyhow::{Result, anyhow};
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
+use std::{env, fs};
 use std::path::{Path, PathBuf};
+use once_cell::sync::OnceCell;
+
+static GLOBAL_RESOLVER: OnceCell<CentralSchemaResolver> = OnceCell::new();
+
 
 #[derive(Debug, Default)]
 pub struct CentralSchemaResolver {
@@ -17,6 +21,20 @@ impl CentralSchemaResolver {
         }
     }
 
+    pub fn global() -> Result<&'static CentralSchemaResolver> {
+        GLOBAL_RESOLVER.get_or_try_init(|| {
+            let mut r = CentralSchemaResolver::new();
+            r.register_ros2_from_env()?;
+            if r.resolved_map.is_empty() {
+                return Err(anyhow!(
+                    "No .msg files found under AMENT_PREFIX_PATH."
+                ));
+            }
+            Ok(r)
+        })
+    }
+
+
     pub fn register_msg_dir(
         &mut self, package: &str, path: PathBuf,
     ) -> Result<()> {
@@ -30,6 +48,25 @@ impl CentralSchemaResolver {
             }
         }
         Ok(())
+    }
+
+    pub fn register_ros2_from_env(&mut self) -> Result<()> {
+        let os = env::var_os("AMENT_PREFIX_PATH")
+            .ok_or_else(|| anyhow!("AMENT_PREFIX_PATH is not set"))?;
+
+
+        println!("SPLITTTTTTT {:?}", env::split_paths(&os).next().unwrap());
+
+        self.register_ros2_standard_paths_any(env::split_paths(&os))
+    }
+
+    pub fn resolve(&self, typename: &str) -> Result<String> {
+        let path = self
+            .resolved_map
+            .get(typename)
+            .ok_or_else(|| anyhow!("Definition not found for: {}", typename))?;
+
+        Ok(fs::read_to_string(path)?.trim().to_string())
     }
 
     pub fn register_ros2_standard_paths(
@@ -57,17 +94,47 @@ impl CentralSchemaResolver {
                 }
             }
         }
-
         Ok(())
     }
 
-    pub fn resolve(&self, typename: &str) -> Result<String> {
-        let path = self
-            .resolved_map
-            .get(typename)
-            .ok_or_else(|| anyhow!("Definition not found for: {}", typename))?;
-        Ok(fs::read_to_string(path)?.trim().to_string())
+    fn register_ros2_standard_paths_any<I>(&mut self, prefixes: I) -> Result<()>
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+
+        let mut prefixes: Vec<PathBuf> = prefixes.into_iter().collect();
+        prefixes.sort();
+        for prefix in prefixes {
+            println!("cargo:rerun-if-changed={}", prefix.display());
+
+
+            let share_dir = prefix.join("share");
+            if !share_dir.exists() {
+                continue;
+            }
+            let mut packages: Vec<_> = fs::read_dir(&share_dir)?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            packages.sort();
+
+            for package_dir in packages {
+                let msg_dir = package_dir.join("msg");
+                if msg_dir.is_dir() {
+                    let package_name = package_dir
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    self.register_msg_dir(&package_name, msg_dir)?;
+                }
+            }
+        }
+        Ok(())
     }
+
+
 
     pub fn flatten(&self, root_type: &str) -> Result<String> {
         let mut visited = HashSet::new();
@@ -78,20 +145,37 @@ impl CentralSchemaResolver {
         Ok(flat.join("\n\n"))
     }
 
-    fn resolve_custom_type(
-        &self, raw: &str, current_package: &str,
-    ) -> Option<String> {
+    fn is_builtin_type(&self, raw: &str) -> bool {
+        // Remove any array suffixes: [], [N], [<=N]
         let base = strip_array_suffix(raw);
 
-        let builtin_types = [
-            "bool", "byte", "char", "int8", "uint8", "int16", "uint16", "int32",
-            "uint32", "int64", "uint64", "float32", "float64", "string",
-            "wstring",
-        ];
-
-        if builtin_types.contains(&base) {
-            return None;
+        // Exact builtins
+        match base {
+            "bool" | "byte" | "char" |
+            "int8" | "uint8" | "int16" | "uint16" |
+            "int32" | "uint32" | "int64" | "uint64" |
+            "float32" | "float64" |
+            "string" | "wstring" => return true,
+            _ => {}
         }
+
+        // Bounded strings: string<=N / wstring<=N
+        if let Some(rest) = base.strip_prefix("string") {
+            return rest.is_empty() || (rest.starts_with("<=") && rest[2..].chars().all(|c| c.is_ascii_digit()));
+        }
+        if let Some(rest) = base.strip_prefix("wstring") {
+            return rest.is_empty() || (rest.starts_with("<=") && rest[2..].chars().all(|c| c.is_ascii_digit()));
+        }
+
+        false
+    }
+
+    fn resolve_custom_type(&self, raw: &str, current_package: &str) -> Option<String> {
+        if self.is_builtin_type(raw) {
+            return None; // don't recurse for builtins (incl. string<=N)
+        }
+
+        let base = strip_array_suffix(raw);
 
         if base.contains('/') {
             if base.contains("/msg/") {
@@ -108,6 +192,38 @@ impl CentralSchemaResolver {
             Some(format!("{}/msg/{}", current_package, base))
         }
     }
+
+
+    // fn resolve_custom_type(
+    //     &self, raw: &str, current_package: &str,
+    // ) -> Option<String> {
+    //     let base = strip_array_suffix(raw);
+    //
+    //     let builtin_types = [
+    //         "bool", "byte", "char", "int8", "uint8", "int16", "uint16", "int32",
+    //         "uint32", "int64", "uint64", "float32", "float64", "string",
+    //         "wstring",
+    //     ];
+    //
+    //     if builtin_types.contains(&base) {
+    //         return None;
+    //     }
+    //
+    //     if base.contains('/') {
+    //         if base.contains("/msg/") {
+    //             Some(base.to_string())
+    //         } else {
+    //             let segments = base.split('/').collect::<Vec<_>>();
+    //             if segments.len() == 2 {
+    //                 Some(format!("{}/msg/{}", segments[0], segments[1]))
+    //             } else {
+    //                 None
+    //             }
+    //         }
+    //     } else {
+    //         Some(format!("{}/msg/{}", current_package, base))
+    //     }
+    // }
 
     fn flatten_inner(
         &self, current_type: &str, definition: &str,
@@ -144,43 +260,165 @@ impl CentralSchemaResolver {
 
         Ok(())
     }
-}
 
-fn strip_array_suffix(s: &str) -> &str {
-    let mut end = s.len();
-    let mut result = s;
-
-    loop {
-        if let Some(start) = result.rfind('[') {
-            if result.ends_with(']') && start < end - 1 {
-                let inner = &result[start + 1..end - 1];
-                if inner.is_empty() || inner.chars().all(|c| c.is_ascii_digit()) {
-                    // Trim this suffix
-                    end = start;
-                    result = &result[..end];
-                    continue; // Check if there are more suffixes
-                }
-            }
+    pub fn generate_all_raw(&self) -> Result<BTreeMap<String, String>> {
+        let mut out = BTreeMap::new();
+        for key in self.resolved_map.keys() {
+            out.insert(key.clone(), self.resolve(key)?);
         }
-        break; // No more valid suffixes found
+        Ok(out)
     }
 
-    result
+    /// Build a map of every known message → flattened text (root + deps).
+    pub fn generate_all_flattened(&self) -> Result<BTreeMap<String, String>> {
+        let mut out = BTreeMap::new();
+        for key in self.resolved_map.keys() {
+            println!("key: {}", key.clone());
+
+            out.insert(key.clone(), self.flatten(key)?);
+        }
+        Ok(out)
+    }
 }
+
+// fn strip_array_suffix(s: &str) -> &str {
+//     let mut end = s.len();
+//     let mut result = s;
+//
+//     loop {
+//         if let Some(start) = result.rfind('[') {
+//             if result.ends_with(']') && start < end - 1 {
+//                 let inner = &result[start + 1..end - 1];
+//                 if inner.is_empty() || inner.chars().all(|c| c.is_ascii_digit()) {
+//                     // Trim this suffix
+//                     end = start;
+//                     result = &result[..end];
+//                     continue; // Check if there are more suffixes
+//                 }
+//             }
+//         }
+//         break; // No more valid suffixes found
+//     }
+//
+//     result
+// }
+fn strip_array_suffix(mut s: &str) -> &str {
+    loop {
+        let Some(lb) = s.rfind('[') else { break; };
+        if !s.ends_with(']') || lb == 0 { break; }
+
+        let inner = s[lb+1..s.len()-1].trim();
+        let ok = inner.is_empty()
+            || inner.chars().all(|c| c.is_ascii_digit())
+            || (inner.starts_with("<=") && inner[2..].trim().chars().all(|c| c.is_ascii_digit()));
+
+        if ok {
+            s = &s[..lb];
+        } else {
+            break;
+        }
+    }
+    s
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const PREFIXES: &str = "/opt/ros/humble";
+    const PREFIXES: &str = "/opt/ros/jazzy";
+
+    #[test]
+    fn test_strip_array_suffix() {
+        println!("{}", strip_array_suffix("FloatingPointRange[<=1]"));
+    }
 
     #[test]
     fn test_register_and_flatten_tf() -> Result<()> {
         let mut resolver = CentralSchemaResolver::new();
         resolver.register_ros2_standard_paths(PREFIXES)?;
 
+        let expected = r#"geometry_msgs/TransformStamped[] transforms
+
+================================================================================
+MSG: geometry_msgs/TransformStamped
+# This expresses a transform from coordinate frame header.frame_id
+# to the coordinate frame child_frame_id at the time of header.stamp
+#
+# This message is mostly used by the
+# <a href="https://docs.ros.org/en/rolling/p/tf2/">tf2</a> package.
+# See its documentation for more information.
+#
+# The child_frame_id is necessary in addition to the frame_id
+# in the Header to communicate the full reference for the transform
+# in a self contained message.
+
+# The frame id in the header is used as the reference frame of this transform.
+std_msgs/Header header
+
+# The frame id of the child frame to which this transform points.
+string child_frame_id
+
+# Translation and rotation in 3-dimensions of child_frame_id from header.frame_id.
+Transform transform
+
+================================================================================
+MSG: std_msgs/Header
+# Standard metadata for higher-level stamped data types.
+# This is generally used to communicate timestamped data
+# in a particular coordinate frame.
+
+# Two-integer timestamp that is expressed as seconds and nanoseconds.
+builtin_interfaces/Time stamp
+
+# Transform frame with which this data is associated.
+string frame_id
+
+================================================================================
+MSG: builtin_interfaces/Time
+# This message communicates ROS Time defined here:
+# https://design.ros2.org/articles/clock_and_time.html
+
+# The seconds component, valid over all int32 values.
+int32 sec
+
+# The nanoseconds component, valid in the range [0, 1e9), to be added to the seconds component. 
+# e.g.
+# The time -1.7 seconds is represented as {sec: -2, nanosec: 3e8}
+# The time 1.7 seconds is represented as {sec: 1, nanosec: 7e8}
+uint32 nanosec
+
+================================================================================
+MSG: geometry_msgs/Transform
+# This represents the transform between two coordinate frames in free space.
+
+Vector3 translation
+Quaternion rotation
+
+================================================================================
+MSG: geometry_msgs/Vector3
+# This represents a vector in free space.
+
+# This is semantically different than a point.
+# A vector is always anchored at the origin.
+# When a transform is applied to a vector, only the rotational component is applied.
+
+float64 x
+float64 y
+float64 z
+
+================================================================================
+MSG: geometry_msgs/Quaternion
+# This represents an orientation in free space in quaternion form.
+
+float64 x 0
+float64 y 0
+float64 z 0
+float64 w 1"#;
+
         let flat = resolver.flatten("tf2_msgs/msg/TFMessage")?;
-        println!("{}", flat);
+        assert_eq!(flat, expected);
+
         Ok(())
     }
 
@@ -221,6 +459,25 @@ mod tests {
 
         let flat = resolver.flatten("unitree_hg/msg/LowState")?;
         println!("{}", flat);
+        Ok(())
+    }
+
+    #[test]
+    fn test_register_floating_point_range() -> Result<()> {
+        let mut resolver = CentralSchemaResolver::new();
+        resolver.register_ros2_standard_paths(PREFIXES)?;
+
+        let flat = resolver.flatten("rcl_interfaces/msg/FloatingPointRange")?;
+        println!("{}", flat);
+        Ok(())
+    }
+
+    #[test]
+    fn test_register_all() -> Result<()> {
+        let resolver = CentralSchemaResolver::global()?;
+        // let raw_map = resolver.generate_all_raw()?;
+        let flat_map = resolver.generate_all_flattened()?;
+
         Ok(())
     }
 }
